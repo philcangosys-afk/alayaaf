@@ -64,7 +64,11 @@ type EmployeeReport = {
   statusLabel: string;
   estimated: boolean;
   notes: string;
+  /** HR-28: خصومات وافق عليها الموظف من بريده لهذا الشهر (ضمن «استقطاعات أخرى») */
+  consented: ConsentedDeduction[];
 };
+
+type ConsentedDeduction = { noticeNo: string; reason: string; factDate: string; amount: number; acceptedAt: string };
 
 const escapeHtml = (value: unknown) =>
   String(value ?? "")
@@ -320,6 +324,32 @@ export default function HREmployeeFullReport() {
           .range(from, to));
         savedRows.push(...rows);
       }
+      // HR-28: الخصومات التي قبلها الموظف لهذا الشهر وسببها (لا خطأ إن لم يُطبَّق التحديث أو لم تكن للقارئ صلاحية الرواتب)
+      const consentedById = new Map<string, ConsentedDeduction[]>();
+      try {
+        for (const part of chunk(selectedEmployees.map((employee) => employee.id))) {
+          const { data: noticeRows, error: noticeError } = await supabase
+            .from("hr_deduction_notices")
+            .select("employee_id, notice_no, reason_name, fact_date, amount, accepted_at")
+            .eq("deduct_month", targetMonth)
+            .eq("status", "مقبول")
+            .in("employee_id", part)
+            .order("accepted_at");
+          if (noticeError) break;
+          (noticeRows ?? []).forEach((row: Record<string, unknown>) => {
+            const id = String(row.employee_id ?? "");
+            consentedById.set(id, [...(consentedById.get(id) ?? []), {
+              noticeNo: String(row.notice_no ?? ""),
+              reason: String(row.reason_name ?? ""),
+              factDate: String(row.fact_date ?? "").slice(0, 10),
+              amount: Number(row.amount) || 0,
+              acceptedAt: String(row.accepted_at ?? ""),
+            }]);
+          });
+        }
+      } catch {
+        consentedById.clear();
+      }
 
       const generated: EmployeeReport[] = selectedEmployees.map((employee) => {
         const line = computation.lines.get(employee.id);
@@ -335,7 +365,7 @@ export default function HREmployeeFullReport() {
           unrecorded: days.filter((day) => day.kind === "unrecorded").length,
         };
         if (computation.notStarted.has(employee.id)) {
-          return { employee, days, counts, figures: null, statusLabel: "لم يبدأ خدمته في هذا الشهر", estimated: false, notes: t("تاريخ التعيين بعد نهاية الشهر") };
+          return { employee, days, counts, figures: null, statusLabel: "لم يبدأ خدمته في هذا الشهر", estimated: false, notes: t("تاريخ التعيين بعد نهاية الشهر"), consented: consentedById.get(employee.id) ?? [] };
         }
         if (saved) {
           return {
@@ -344,6 +374,7 @@ export default function HREmployeeFullReport() {
             statusLabel: payrollStatusLabel(String(saved.status ?? ""), String(saved.accounting_status ?? "")),
             estimated: false,
             notes: localizePayrollNotes(String(saved.notes ?? "")),
+            consented: consentedById.get(employee.id) ?? [],
           };
         }
         return {
@@ -352,6 +383,7 @@ export default function HREmployeeFullReport() {
           statusLabel: "تقديري: لا يوجد صف رواتب محفوظ لهذا الشهر",
           estimated: true,
           notes: line ? (locale === "en" ? `Estimated calculation up to today — ${line.workDays} work days` : `حساب تقديري حتى تاريخ اليوم — ${line.workDays} يوم عمل`) : "",
+          consented: consentedById.get(employee.id) ?? [],
         };
       });
       if (seq !== generateSeq.current) return;
@@ -416,6 +448,7 @@ export default function HREmployeeFullReport() {
           </div>` : ""}
           <div class="section-title"><h3>${escapeHtml(t("تفصيل الاستقطاعات"))}</h3></div>
           <table class="deductions-table"><thead><tr><th>${escapeHtml(t("البند"))}</th><th>${escapeHtml(t("المبلغ"))}</th></tr></thead><tbody>${deductionRows}</tbody></table>
+          ${report.consented.length ? `<div class="section-title"><h3>${escapeHtml(t("خصومات بموافقة الموظف"))}</h3></div><table class="deductions-table"><thead><tr><th>${escapeHtml(t("رقم الإشعار"))}</th><th>${escapeHtml(t("السبب"))}</th><th>${escapeHtml(t("تاريخ الواقعة"))}</th><th>${escapeHtml(t("المبلغ"))}</th></tr></thead><tbody>${report.consented.map((item) => `<tr><td dir="ltr">${escapeHtml(item.noticeNo)}</td><td>${escapeHtml(t(item.reason))}</td><td>${escapeHtml(formatDate(item.factDate))}</td><td>${money(item.amount)} ${currency}</td></tr>`).join("")}</tbody></table>` : ""}
           ${report.notes ? `<div class="reason"><span>${escapeHtml(t("تفاصيل الحساب"))}</span><p>${escapeHtml(report.notes)}</p></div>` : ""}
           ${figures ? `<div class="net ${report.estimated ? "est" : ""}"><span>${escapeHtml(report.estimated ? t("صافي الراتب (تقديري)") : t("صافي الراتب"))}</span><strong>${money(figures.net)} ${currency}</strong></div>` : ""}
           <div class="signatures"><div>${escapeHtml(t("مسؤول الموارد البشرية"))}</div><div>${escapeHtml(t("المدير المالي"))}</div></div>
@@ -651,6 +684,23 @@ export default function HREmployeeFullReport() {
                           <div key={item.label} className="flex items-center justify-between rounded-lg border border-slate-100 px-3 py-2 text-sm">
                             <span className="text-slate-600">{t(item.label)}</span>
                             <strong className="text-rose-700">{money(item.value)} {t("ر.س")}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {report.consented.length > 0 && (
+                    <div className="border-t border-slate-100 px-5 py-4">
+                      <h4 className="mb-1 font-bold text-slate-900">{t("خصومات بموافقة الموظف")}</h4>
+                      <p className="mb-2 text-xs text-slate-500">{t("وافق عليها الموظف من بريده، وتُحسب في كشف الراتب ضمن «استقطاعات أخرى» بحد نصف الأجر؛ إن حُفظ كشف الشهر قبل القبول فأعد إرساله")}</p>
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        {report.consented.map((item) => (
+                          <div key={item.noticeNo} className="flex items-start justify-between gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm">
+                            <span className="min-w-0">
+                              <span className="block text-slate-800">{t(item.reason)}</span>
+                              <small className="text-slate-500"><span dir="ltr">{item.noticeNo}</span> · {t("تاريخ الواقعة")} {formatDate(item.factDate)}</small>
+                            </span>
+                            <strong className="whitespace-nowrap text-rose-700">{money(item.amount)} {t("ر.س")}</strong>
                           </div>
                         ))}
                       </div>

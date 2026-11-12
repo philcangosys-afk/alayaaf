@@ -46,6 +46,8 @@ export default function EmployeeDeductionsPanel({ employeeId, baseSalary, canMan
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [unavailable, setUnavailable] = useState(false);
+  // HR-28: اقتطاعات من إشعار خصم وافق عليه الموظف؛ تُعدَّل وتُزال من «الخصومات والإيميلات» فقط
+  const [linked, setLinked] = useState<Map<string, string>>(new Map());
   const loadSeq = useRef(0);
   const currentMonth = riyadhMonth();
   const money = (value: number) => `${formatNumber(value, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${t("ر.س")}`;
@@ -81,6 +83,18 @@ export default function EmployeeDeductionsPanel({ employeeId, baseSalary, canMan
     }));
     setRows(list);
     onCountChange?.(list.length);
+    const linkedIds = new Map<string, string>();
+    if (list.length > 0) {
+      // قبل تحديث قاعدة البيانات (HR-28) أو بلا صلاحية قراءة الإشعارات: لا شيء مرتبط ظاهر، وقاعدة البيانات تمنع التعديل على أي حال
+      const { data: noticeRows } = await supabase
+        .from("hr_deduction_notices")
+        .select("deduction_id, notice_no")
+        .in("deduction_id", list.map((row) => row.id))
+        .eq("status", "مقبول");
+      ((noticeRows ?? []) as Record<string, unknown>[]).forEach((row) => linkedIds.set(String(row.deduction_id ?? ""), String(row.notice_no ?? "")));
+    }
+    if (seq !== loadSeq.current) return;
+    setLinked(linkedIds);
     // أنواع الاقتطاعات المعرّفة في «أنواع الاقتطاعات المالية»، وإلا الأنواع الافتراضية
     const configured = ((typeResult.data ?? []) as Record<string, unknown>[])
       .filter((row) => !["غير فعال", "inactive", "موقوف"].includes(String(row.status ?? "").trim()))
@@ -150,6 +164,11 @@ export default function EmployeeDeductionsPanel({ employeeId, baseSalary, canMan
   };
 
   const canEdit = canManage && !isOwn && !unavailable;
+  // ملاحظة اقتطاع الإشعار (HR-28) محفوظة بالعربية: «إشعار DN-… (بموافقة الموظف): الواقعة»
+  const noteText = (notes: string) => {
+    const match = /^إشعار (DN-\d+) \(بموافقة الموظف\): ([\s\S]*)$/.exec(notes);
+    return match ? `${t("إشعار خصم")} ${match[1]} (${t("بموافقة الموظف")}): ${match[2]}` : notes;
+  };
 
   return (
     <div className="space-y-3">
@@ -233,9 +252,14 @@ export default function EmployeeDeductionsPanel({ employeeId, baseSalary, canMan
                   <td className="whitespace-nowrap px-3 py-2">{row.startMonth}</td>
                   <td className="whitespace-nowrap px-3 py-2">{row.endMonth || t("مستمر")}</td>
                   <td className="px-3 py-2"><span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${state.className}`}>{t(state.label)}</span></td>
-                  <td className="max-w-48 px-3 py-2 text-gray-600">{row.notes || "—"}</td>
+                  <td className="max-w-48 px-3 py-2 text-gray-600">{noteText(row.notes) || "—"}</td>
                   <td className="px-3 py-2 text-xs text-gray-600">{row.createdBy || "—"}{row.updatedBy ? ` (${t("عدّله")} ${row.updatedBy})` : ""}</td>
-                  {canEdit && (
+                  {canEdit && linked.has(row.id) && (
+                    <td className="px-3 py-2 text-center text-[11px] text-slate-500" title={t("يُعدَّل أو يُزال من «الخصومات والإيميلات» ← «سجلات الإيميلات»")}>
+                      {t("بموافقة الموظف")} <span dir="ltr">{linked.get(row.id)}</span>
+                    </td>
+                  )}
+                  {canEdit && !linked.has(row.id) && (
                     <td className="px-3 py-2">
                       <div className="flex items-center justify-center gap-2">
                         <button type="button" data-readonly-exempt disabled={busy} onClick={() => { setDraft({ id: row.id, type: row.type, calcType: row.calcType, value: String(row.value), startMonth: row.startMonth, endMonth: row.endMonth, notes: row.notes }); setError(""); setMessage(""); }} className="text-[#004e89] hover:text-[#003d6b] disabled:opacity-50" title={t("تعديل")}><Pencil className="h-4 w-4" /></button>

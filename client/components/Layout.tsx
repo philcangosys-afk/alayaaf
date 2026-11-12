@@ -496,7 +496,7 @@ const hrNavItems: HRNavItem[] = [
   },
   {
     icon: Wrench,
-    label: "إيميلات الموظفين",
+    label: "الخصومات والإيميلات",
     href: "/hr/deductions-emails",
     hasChildren: false,
   },

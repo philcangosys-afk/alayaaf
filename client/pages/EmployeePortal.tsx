@@ -2201,6 +2201,7 @@ export default function EmployeePortal() {
           onBack={() => setCurrentPage("home")}
           empId={user.empId}
           employeeName={user.name}
+          onOpenRequests={() => setCurrentPage("requests")}
         />
       )}
 

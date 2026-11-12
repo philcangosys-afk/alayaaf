@@ -1,8 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
-import { Mail, Trash2, Send, Settings as SettingsIcon, ChevronLeft, Lock, Eye, EyeOff } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Mail, Trash2, Send, Settings as SettingsIcon, ChevronLeft, Lock, Eye, EyeOff, CheckCircle2, MessageSquare, Loader2 } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
 import { toast } from "sonner";
 import { useI18n } from "@/i18n";
+import {
+  NOTICE_STATUS_STYLE,
+  deductionErrorText,
+  displayStatus,
+  loadNoticesByIds,
+  localizeNoticeSubject,
+  noticeTerms,
+  respondNotice,
+  type DeductionNotice,
+} from "@/lib/deductionNotices";
 
 interface MailMessage {
   id: string;
@@ -17,6 +27,9 @@ interface MailMessage {
   purged_by_recipient_at?: string | null;
   /** رسالة أنشأها نظام الخصم الآلي القديم (موقوف): محفوظة للمراجعة ولا تُعدَّل */
   deduction_assignment_id?: string | null;
+  /** HR-28: إشعار الخصم المرتبط بالرسالة (يرد عليه الموظف بالقبول أو التواصل مع الإدارة) */
+  hr_deduction_notice_id?: string | null;
+  message_kind?: string | null;
   created_at: string;
 }
 
@@ -27,12 +40,15 @@ export default function EmployeeEmailPage({
   onBack,
   empId,
   employeeName,
+  onOpenRequests,
 }: {
   onBack: () => void;
   empId?: string;
   employeeName?: string;
+  /** HR-28: «التواصل مع الإدارة» ينقل الموظف إلى لوحة الطلبات ليرسل طلبه */
+  onOpenRequests?: () => void;
 }) {
-  const { t, direction, formatDate } = useI18n();
+  const { t, direction, formatDate, formatNumber, locale } = useI18n();
   const [activeFolder, setActiveFolder] = useState<Folder>("inbox");
   const [employeeEmail, setEmployeeEmail] = useState("");
   const [messages, setMessages] = useState<MailMessage[]>([]);
@@ -44,6 +60,8 @@ export default function EmployeeEmailPage({
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [loginError, setLoginError] = useState("");
   const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null);
+  const [notices, setNotices] = useState<Map<string, DeductionNotice>>(new Map());
+  const [respondingId, setRespondingId] = useState("");
 
   useEffect(() => {
     async function loadEmployeeEmail() {
@@ -67,22 +85,96 @@ export default function EmployeeEmailPage({
     loadEmployeeEmail();
   }, [empId]);
 
-  useEffect(() => {
-    async function loadMessages() {
-      if (!employeeEmail || !mailboxAuthenticated) {
-        setMessages([]);
-        return;
-      }
-      const { data, error } = await supabase
-        .from("employee_mail_messages")
-        .select("id, from_email, to_email, subject, body, read_at, deleted_by_sender_at, deleted_by_recipient_at, purged_by_sender_at, purged_by_recipient_at, deduction_assignment_id, created_at")
-        .or(`to_email.eq.${employeeEmail},from_email.eq.${employeeEmail}`)
-        .order("created_at", { ascending: false });
-      if (!error && data) setMessages(data as MailMessage[]);
+  const loadMessages = useCallback(async () => {
+    if (!employeeEmail || !mailboxAuthenticated) {
+      setMessages([]);
+      setNotices(new Map());
+      return;
     }
-
-    loadMessages();
+    // "*" لا أسماء أعمدة بعينها: عمود hr_deduction_notice_id لا يوجد قبل تحديث قاعدة البيانات (HR-28)
+    const { data, error } = await supabase
+      .from("employee_mail_messages")
+      .select("*")
+      .or(`to_email.eq.${employeeEmail},from_email.eq.${employeeEmail}`)
+      .order("created_at", { ascending: false });
+    if (error || !data) return;
+    const rows = data as MailMessage[];
+    setMessages(rows);
+    const noticeIds = rows.map((message) => String(message.hr_deduction_notice_id ?? "")).filter(Boolean);
+    if (noticeIds.length === 0) {
+      setNotices(new Map());
+      return;
+    }
+    try {
+      const loaded = await loadNoticesByIds(noticeIds);
+      setNotices(new Map(loaded.map((notice) => [notice.id, notice])));
+    } catch {
+      setNotices(new Map());
+    }
   }, [employeeEmail, mailboxAuthenticated]);
+
+  useEffect(() => {
+    void loadMessages();
+  }, [loadMessages]);
+
+  const respond = async (shown: DeductionNotice, action: "accept" | "contact") => {
+    setRespondingId(shown.id);
+    // أحدث بيانات الإشعار قبل التأكيد: الموظف يوافق على ما يراه الآن، والخادم يرفض القبول إن تغيّر بعده
+    let notice = shown;
+    try {
+      const [fresh] = await loadNoticesByIds([shown.id]);
+      if (fresh) {
+        notice = fresh;
+        setNotices((current) => new Map(current).set(fresh.id, fresh));
+      }
+    } catch {
+      // يبقى المعروض؛ الخادم يتحقق من الشروط
+    }
+    if (notice.status === "مقبول" || notice.status === "أُزيل") {
+      toast.info(notice.status === "مقبول" ? t("قبلت هذا الخصم مسبقًا") : t("أزالت الإدارة هذا الخصم ولن يُخصم من راتبك."));
+      setRespondingId("");
+      return;
+    }
+    // تغيّر الإشعار بعد فتحه: تُعرض بياناته الجديدة في البطاقة، ويختار الموظف من جديد بعد مراجعتها
+    const changed = notice.amount !== shown.amount || notice.deductMonth !== shown.deductMonth || notice.factDate !== shown.factDate
+      || notice.factDetails !== shown.factDetails || notice.factRef !== shown.factRef || (notice.updatedAt || notice.sentAt) !== (shown.updatedAt || shown.sentAt);
+    if (changed) {
+      toast.warning(t("عدّلت الإدارة هذا الإشعار بعد أن فتحته؛ راجع بياناته الجديدة ثم اختر من جديد"));
+      setRespondingId("");
+      return;
+    }
+    const money = formatNumber(notice.amount, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const question = action === "accept"
+      ? `${t("أوافق على خصم")} ${money} ${t("ر.س")} ${t("من راتب شهر")} ${notice.deductMonth} ${t("للسبب")}: ${t(notice.reasonName)}. ${t("متابعة؟")}`
+      : t("سيُسجَّل أنك تريد التواصل مع الإدارة بشأن هذا الإشعار، ولن يُخصم شيء، ثم تنتقل إلى لوحة الطلبات لترسل طلبك. متابعة؟");
+    if (!window.confirm(question)) {
+      setRespondingId("");
+      return;
+    }
+    try {
+      await respondNotice(notice.id, action, action === "accept" ? noticeTerms(notice) : undefined);
+      toast.success(action === "accept" ? t("تم تسجيل قبولك؛ يُخصم المبلغ من راتب الشهر المحدد") : t("تم تسجيل طلب التواصل؛ أرسل طلبك للإدارة من لوحة الطلبات"));
+      await loadMessages();
+      if (action === "contact" && onOpenRequests) onOpenRequests();
+    } catch (respondError) {
+      const locked = String((respondError as { message?: unknown } | null)?.message ?? "").includes("HR28_MONTH_LOCKED");
+      toast.error(locked
+        ? t("رواتب شهر الخصم أُغلقت؛ لا يُسجَّل القبول الآن. تواصل مع الإدارة لتغيير شهر الخصم")
+        : deductionErrorText(respondError, t("تعذر تسجيل ردك")));
+      if (String((respondError as { message?: unknown } | null)?.message ?? "").includes("HR28_NOTICE_CHANGED")) await loadMessages();
+    } finally {
+      setRespondingId("");
+    }
+  };
+
+  const isNoticeMessage = (message: MailMessage) => Boolean(message.hr_deduction_notice_id) && ["hr_deduction", "hr_deduction_reply"].includes(String(message.message_kind ?? ""));
+  const subjectText = (message: MailMessage) => (isNoticeMessage(message) ? localizeNoticeSubject(message.subject, t) : message.subject);
+  /** معاينة رسالة الإشعار بلغة الواجهة (نص الرسالة المحفوظ عربي) */
+  const previewText = (message: MailMessage) => {
+    const notice = isNoticeMessage(message) && locale === "en" ? notices.get(String(message.hr_deduction_notice_id)) : undefined;
+    if (!notice) return message.body;
+    return `${t(notice.reasonName)} · ${formatNumber(notice.amount, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${t("ر.س")} · ${notice.deductMonth}`;
+  };
 
   const inbox = useMemo(
     () => messages.filter((message) => message.to_email === employeeEmail && !message.deleted_by_recipient_at),
@@ -329,9 +421,18 @@ export default function EmployeeEmailPage({
                             <p dir="ltr" className="truncate text-left font-semibold">
                               {activeFolder === "inbox" ? message.from_email : activeFolder === "sent" ? message.to_email : message.from_email === employeeEmail ? message.to_email : message.from_email}
                             </p>
-                            <p className="mt-1 truncate text-sm text-gray-300">{message.subject}</p>
+                            <p className="mt-1 truncate text-sm text-gray-300">{subjectText(message)}</p>
                             {message.deduction_assignment_id && <p className="mt-1 text-xs text-amber-400">{t("رسالة آلية من نظام خصم موقوف — ليست صادرة من شخص")}</p>}
-                            <p className="mt-2 truncate text-xs text-gray-500">{message.body}</p>
+                            {isNoticeMessage(message) && message.to_email === employeeEmail && notices.get(String(message.hr_deduction_notice_id)) && (() => {
+                              const notice = notices.get(String(message.hr_deduction_notice_id)) as DeductionNotice;
+                              const shown = displayStatus(notice);
+                              return (
+                                <span className={`mt-1 inline-block rounded-full border px-2 py-0.5 text-[11px] font-semibold ${NOTICE_STATUS_STYLE[shown]}`}>
+                                  {shown === "بانتظار الرد" || shown === "انتهت مهلة الرد" ? t("بانتظار ردك") : t(shown)}
+                                </span>
+                              );
+                            })()}
+                            <p className="mt-2 truncate text-xs text-gray-500">{previewText(message)}</p>
                           </div>
                           <span className="whitespace-nowrap text-xs text-gray-500">{formatDate(message.created_at, { dateStyle: "medium" })}</span>
                         </div>
@@ -392,14 +493,84 @@ export default function EmployeeEmailPage({
                       <Trash2 className="h-5 w-5" />
                     </button>
                   </div>
-                  <h2 className="text-xl font-bold mb-2">{selectedEmail.subject}</h2>
+                  <h2 className="text-xl font-bold mb-2">{subjectText(selectedEmail)}</h2>
                   {selectedEmail.deduction_assignment_id && (
                     <div className="mb-4 rounded border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-300">
                       {t("هذه رسالة أنشأها آليًا نظام خصم قديم أُوقف، وليست صادرة من شخص، وهي محفوظة للمراجعة. لأي استفسار عن راتبك راجع الموارد البشرية.")}
                     </div>
                   )}
                   <div className="text-sm text-gray-400 mb-6">{formatDate(selectedEmail.created_at, { dateStyle: "medium", timeStyle: "short" })}</div>
-                  <div className="bg-gray-900 p-4 rounded text-white leading-relaxed whitespace-pre-line">{selectedEmail.body}</div>
+                  {isNoticeMessage(selectedEmail) && (() => {
+                    const notice = notices.get(String(selectedEmail.hr_deduction_notice_id));
+                    if (!notice) return null;
+                    const shown = displayStatus(notice);
+                    const canReply = selectedEmail.to_email === employeeEmail && selectedEmail.message_kind === "hr_deduction";
+                    const open = notice.status === "بانتظار الرد" || notice.status === "طلب تواصل";
+                    const money = formatNumber(notice.amount, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    const row = (label: string, value: string, ltr = false) => (
+                      <div className="flex gap-2 text-sm"><span className="w-32 shrink-0 text-gray-400">{t(label)}</span><span dir={ltr ? "ltr" : undefined} className="text-white">{value}</span></div>
+                    );
+                    return (
+                      <div className="mb-4 space-y-3 rounded-lg border border-sky-500/40 bg-sky-500/10 p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="font-bold text-sky-200">{t("إشعار خصم")} <span dir="ltr">{notice.noticeNo}</span></p>
+                          <span className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${NOTICE_STATUS_STYLE[shown]}`}>{t(shown)}</span>
+                        </div>
+                        {canReply && <p className="text-xs text-gray-400">{t("البيانات الحالية للإشعار (بعد أي تعديل من الإدارة)")}</p>}
+                        <div className="space-y-1">
+                          {row("السبب", t(notice.reasonName))}
+                          {row("المجموعة", t(notice.groupName))}
+                          {row("تاريخ الواقعة", notice.factDate, true)}
+                          {row("تفاصيل الواقعة", notice.factDetails)}
+                          {notice.factRef && row("المرجع", notice.factRef)}
+                          {row("المبلغ", `${money} ${t("ر.س")}`)}
+                          {row("شهر الخصم", notice.deductMonth, true)}
+                          {open && row("يرجى الرد قبل", formatDate(notice.replyDueAt, { dateStyle: "medium", timeStyle: "short" }))}
+                        </div>
+                        {notice.status === "مقبول" && (
+                          <p className="flex items-center gap-2 rounded bg-emerald-500/15 p-2 text-sm text-emerald-300">
+                            <CheckCircle2 className="h-4 w-4" />
+                            {t("قبلت هذا الخصم")} {notice.acceptedAt ? formatDate(notice.acceptedAt, { dateStyle: "medium", timeStyle: "short" }) : ""} — {t("يُخصم من راتب شهر")} <span dir="ltr">{notice.deductMonth}</span>
+                          </p>
+                        )}
+                        {notice.status === "أُزيل" && (
+                          <p className="rounded bg-gray-700/60 p-2 text-sm text-gray-200">{t("أزالت الإدارة هذا الخصم ولن يُخصم من راتبك.")}{notice.removalReason ? ` ${t("السبب")}: ${notice.removalReason}` : ""}</p>
+                        )}
+                        {canReply && open && (
+                          <>
+                            <p className="text-xs leading-5 text-gray-300">{t("لا يُخصم أي مبلغ من راتبك إلا بعد قبولك. إن كان لديك اعتراض أو استفسار اختر «التواصل مع الإدارة».")}</p>
+                            {notice.status === "طلب تواصل" && <p className="text-xs text-violet-300">{t("طلبت التواصل مع الإدارة؛ أرسل طلبك من لوحة الطلبات، ويمكنك القبول لاحقًا إن اتفقت مع الإدارة.")}</p>}
+                            <div className="flex flex-wrap gap-2">
+                              <button type="button" disabled={Boolean(respondingId)} onClick={() => void respond(notice, "accept")}
+                                className="flex items-center gap-1 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50">
+                                {respondingId === notice.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}{t("قبول")}
+                              </button>
+                              {notice.status === "بانتظار الرد" ? (
+                                <button type="button" disabled={Boolean(respondingId)} onClick={() => void respond(notice, "contact")}
+                                  className="flex items-center gap-1 rounded-lg border border-violet-400 px-4 py-2 text-sm font-semibold text-violet-200 hover:bg-violet-500/10 disabled:opacity-50">
+                                  <MessageSquare className="h-4 w-4" />{t("التواصل مع الإدارة")}
+                                </button>
+                              ) : onOpenRequests ? (
+                                <button type="button" onClick={onOpenRequests}
+                                  className="flex items-center gap-1 rounded-lg border border-violet-400 px-4 py-2 text-sm font-semibold text-violet-200 hover:bg-violet-500/10">
+                                  <MessageSquare className="h-4 w-4" />{t("فتح لوحة الطلبات")}
+                                </button>
+                              ) : null}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  {isNoticeMessage(selectedEmail) && locale === "en" ? (
+                    // نص الرسالة المحفوظ عربي: البطاقة أعلاه مترجمة، والنص الأصلي عند الطلب فقط
+                    <details className="rounded bg-gray-900 p-3 text-sm">
+                      <summary className="cursor-pointer text-xs text-gray-400">{t("نص الرسالة كما حُفظ")}</summary>
+                      <div dir="rtl" lang="ar" className="mt-2 whitespace-pre-line leading-relaxed text-white">{selectedEmail.body}</div>
+                    </details>
+                  ) : (
+                    <div className="bg-gray-900 p-4 rounded text-white leading-relaxed whitespace-pre-line">{selectedEmail.body}</div>
+                  )}
                 </div>
               </div>
             </div>
